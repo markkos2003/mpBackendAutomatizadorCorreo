@@ -1,4 +1,13 @@
-.env
+# Entorno virtual
 venv/
+env/
+
+# Variables de entorno y credenciales
+.env
+*.env
+client_secret*.json
+
+# Archivos temporales de Python
 __pycache__/
 *.pyc
+.pytest_cache/
