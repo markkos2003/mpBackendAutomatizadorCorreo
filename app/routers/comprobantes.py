@@ -5,10 +5,8 @@ import xml.etree.ElementTree as ET
 from typing import List
 import gc
 from datetime import datetime
-from app.services.parseo_imagenes import _es_resultado_valido
-from app.services.parseo_imagenes import _parsear_tesseract
-from app.services.parseo_imagenes import _parsear_ocr_space
-from app.services.parseo_imagenes import _parsear_gemini_ia
+
+from app.services.parseo_imagenes import procesar_imagen_comprobante
 
 
 import pytesseract
@@ -182,23 +180,7 @@ def parsear_pdf_sunat(pdf_bytes: bytes) -> dict:
         return None
 # --- 3. PARSER IMAGEN (OCR) ---
 
-def parsear_imagen_sunat(imagen_bytes: bytes) -> dict:
-    # 1. Intentar PyTesseract (Local)
-    res = _parsear_tesseract(imagen_bytes)
-    if _es_resultado_valido(res):
-        return res
 
-    # 2. Intentar OCR.space (API Gratis)
-    res = _parsear_ocr_space(imagen_bytes)
-    if _es_resultado_valido(res):
-        return res
-
-    # 3. ÚLTIMO RECURSO: Gemini IA
-    res = _parsear_gemini_ia(imagen_bytes)
-    if _es_resultado_valido(res):
-        return res
-
-    return None
 # --- LÓGICA DE LECTURA DE BANDEJA ---
 
 def procesar_bandeja_usuario(user_id: str, provider: str):
@@ -216,7 +198,7 @@ def procesar_bandeja_usuario(user_id: str, provider: str):
         .execute()
     
     if not res.data:
-        print(f"❌ No se encontró un token guardado de {provider_clean} para el usuario {user_id}.")
+        print(f" No se encontró un token guardado de {provider_clean} para el usuario {user_id}.")
         return
 
     # Extrae el registro sin hacer bucle
@@ -224,7 +206,7 @@ def procesar_bandeja_usuario(user_id: str, provider: str):
     refresh_token = token_record.get("refresh_token")
 
     if not refresh_token:
-        print(f"⚠️ El registro para {provider_clean} no tiene refresh_token.")
+        print(f" El registro para {provider_clean} no tiene refresh_token.")
         return
 
     # Ejecuta directamente la función según el proveedor recibido
@@ -237,7 +219,7 @@ def procesar_bandeja_usuario(user_id: str, provider: str):
         _procesar_outlook(user_id, refresh_token)
 
     else:
-        print(f"❌ Proveedor no soportado: {provider_clean}")
+        print(f" Proveedor no soportado: {provider_clean}")
 
 # --- SUB-FUNCIONES PRIVADAS POR PROVEEDOR ---
 
@@ -283,6 +265,15 @@ def _procesar_gmail(user_id: str, refresh_token: str):
             for part in parts:
                 filename = part.get('filename', '').lower()
                 attachment_id = part.get('body', {}).get('attachmentId')
+                size = part.get('body', {}).get('size', 0)
+
+                            # 1. Ignorar imágenes pequeñas (menores a 15KB) que suelen ser logos o firmas
+                if filename.endswith(('.png', '.jpg', '.jpeg')) and size < 35000:
+                                continue
+
+                            # 2. Ignorar nombres comunes de logos
+                if any(ignora in filename for ignora in ['logo', 'signature', 'banner', 'avatar', 'icon']):
+                                continue
 
                 if attachment_id and (filename.endswith('.pdf') or filename.endswith('.xml') or filename.endswith(('.png', '.jpg', '.jpeg'))):
                     try:
@@ -299,26 +290,36 @@ def _procesar_gmail(user_id: str, refresh_token: str):
                             datos = parsear_pdf_sunat(file_bytes)
                         elif filename.endswith(('.png', '.jpg', '.jpeg')):
                             try:
-                                datos = parsear_imagen_sunat(file_bytes)
+                                datos = procesar_imagen_comprobante(file_bytes)
                             except Exception as ocr_err:
-                                print(f"⚠️ OCR falló en {filename}: {str(ocr_err)}")
+                                print(f" OCR falló en {filename}: {str(ocr_err)}")
                                 continue
 
                         if es_comprobante_valido(datos):
                             datos["user_id"] = user_id
                             comprobantes_procesados.append(datos)
-                            print(f"✅ VÁLIDO (Gmail): RUC {datos['ruc_emisor']} | {datos['serie_numero']} | S/ {datos['monto_total']}")
+                            print(f" VÁLIDO (Gmail): RUC {datos['ruc_emisor']} | {datos['serie_numero']} | S/ {datos['monto_total']}")
                     except Exception as err:
-                        print(f"⚠️ Error en archivo {filename}: {str(err)}")
+                        print(f" Error en archivo {filename}: {str(err)}")
+
+                    # AGREGAR AQUÍ: Guardar progresivamente cada 10 comprobantes válidos encontrados
+                    if len(comprobantes_procesados) >= 10:
+                        _guardar_en_supabase(comprobantes_procesados, user_id)
+                        comprobantes_procesados.clear()
+                        gc.collect()    
 
                     archivos_procesados_count += 1
                     if archivos_procesados_count % 50 == 0:
                         gc.collect()
 
         except Exception as msg_err:
-            print(f"⚠️ Error leyendo mensaje Gmail ID {msg.get('id')}: {str(msg_err)}")
+            print(f" Error leyendo mensaje Gmail ID {msg.get('id')}: {str(msg_err)}")
 
-    _guardar_en_supabase(comprobantes_procesados, user_id)
+    # Guardar cualquier remanente final que no llegó a 10
+    if comprobantes_procesados:
+        _guardar_en_supabase(comprobantes_procesados, user_id)
+        comprobantes_procesados.clear()
+        gc.collect()
 
 
 def _procesar_outlook(user_id: str, refresh_token: str):
@@ -371,6 +372,15 @@ def _procesar_outlook(user_id: str, refresh_token: str):
 
             for adj in adjuntos:
                 filename = adj.get("name", "").lower()
+                size = adj.get("size", 0)
+
+                # Ignorar imágenes pequeñas de firmas/logos
+                if filename.endswith(('.png', '.jpg', '.jpeg')) and size < 35000:
+                    continue
+
+                if any(ignora in filename for ignora in ['logo', 'signature', 'banner', 'avatar', 'icon']):
+                    continue
+
                 if adj.get("@odata.type") == "#microsoft.graph.fileAttachment" and (
                     filename.endswith('.pdf') or filename.endswith('.xml') or filename.endswith(('.png', '.jpg', '.jpeg'))
                 ):
@@ -384,31 +394,41 @@ def _procesar_outlook(user_id: str, refresh_token: str):
                             datos = parsear_pdf_sunat(file_bytes)
                         elif filename.endswith(('.png', '.jpg', '.jpeg')):
                             try:
-                                datos = parsear_imagen_sunat(file_bytes)
+                                datos = procesar_imagen_comprobante(file_bytes)
                             except Exception as ocr_err:
-                                print(f"⚠️ OCR falló en {filename}: {str(ocr_err)}")
+                                print(f" OCR falló en {filename}: {str(ocr_err)}")
                                 continue
 
                         if es_comprobante_valido(datos):
                             datos["user_id"] = user_id
                             comprobantes_procesados.append(datos)
-                            print(f"✅ VÁLIDO (Outlook): RUC {datos['ruc_emisor']} | {datos['serie_numero']} | S/ {datos['monto_total']}")
+                            print(f" VÁLIDO (Outlook): RUC {datos['ruc_emisor']} | {datos['serie_numero']} | S/ {datos['monto_total']}")
                     except Exception as err:
-                        print(f"⚠️ Error en archivo {filename}: {str(err)}")
+                        print(f" Error en archivo {filename}: {str(err)}")
+
+                    # --- AGREGAR ESTO: Guardar cada 10 comprobantes ---
+                    if len(comprobantes_procesados) >= 10:
+                        _guardar_en_supabase(comprobantes_procesados, user_id)
+                        comprobantes_procesados.clear()
+                        gc.collect()    
 
                     archivos_procesados_count += 1
                     if archivos_procesados_count % 50 == 0:
                         gc.collect()
 
         except Exception as msg_err:
-            print(f"⚠️ Error leyendo mensaje Outlook ID {msg_id}: {str(msg_err)}")
+            print(f" Error leyendo mensaje Outlook ID {msg_id}: {str(msg_err)}")
 
-    _guardar_en_supabase(comprobantes_procesados, user_id)
+    # --- REMPLAZAR LA LÍNEA FINAL DE GUARDA POR ESTAS LÍNEAS ---
+    if comprobantes_procesados:
+        _guardar_en_supabase(comprobantes_procesados, user_id)
+        comprobantes_procesados.clear()
+        gc.collect()
 
 
 def _guardar_en_supabase(comprobantes_procesados: list, user_id: str):
     if not comprobantes_procesados:
-        print(f"ℹ️ No se encontraron nuevos comprobantes válidos para {user_id}")
+        print(f"ℹ No se encontraron nuevos comprobantes válidos para {user_id}")
         return
 
     # 1. Elimina duplicados que hayan venido en el mismo lote de correos usando una clave única
@@ -421,21 +441,28 @@ def _guardar_en_supabase(comprobantes_procesados: list, user_id: str):
 
     # 2. Inserta o actualiza (upsert) en la base de datos por lotes de 10 en 10
     if lista_final:
-        lote_tamano = 10
-        for i in range(0, len(lista_final), lote_tamano):
-            sub_lista = lista_final[i:i + lote_tamano]
+        try:
             supabase.table("comprobantes").upsert(
-                sub_lista, 
+                lista_final, 
                 on_conflict="user_id, ruc_emisor, serie_numero",
                 returning="minimal"
             ).execute()
-        
-        print(f"✅ Se registraron exitosamente {len(lista_final)} comprobantes únicos para {user_id}")
-    
+            print(f" Se guardaron {len(lista_final)} comprobantes en Supabase para el usuario.")
+        except Exception as e:
+            print(f" Error al insertar lote en Supabase: {str(e)}")
     # 3. Limpieza de memoria
     gc.collect()
 
 # --- ENDPOINTS ---
+
+escaneos_activos = {}
+
+def tarea_procesar_bandeja(user_id: str, provider: str):
+    try:
+        escaneos_activos[user_id] = True  # Marca que inició
+        procesar_bandeja_usuario(user_id, provider)
+    finally:
+        escaneos_activos[user_id] = False
 
 @router.post("/procesar-correos")
 async def procesar_correos(
@@ -443,12 +470,18 @@ async def procesar_correos(
     provider: str, 
     background_tasks: BackgroundTasks
 ):
-    background_tasks.add_task(procesar_bandeja_usuario, user_id, provider)
+    # Cambiamos la llamada para usar la función con control de estado
+    background_tasks.add_task(tarea_procesar_bandeja, user_id, provider)
     return {
         "message": "Escaneo iniciado en segundo plano", 
         "user_id": user_id,
         "provider": provider
     }
+
+@router.get("/estado-escaneo")
+def obtener_estado_escaneo(user_id: str):
+    en_proceso = escaneos_activos.get(user_id, False)
+    return {"procesando": en_proceso}
 
 @router.get("/registros")
 def obtener_registros(user_id: str):
@@ -462,6 +495,6 @@ def obtener_registros(user_id: str):
             
         return response.data
     except Exception as e:
-        print(f"❌ Error al consultar Supabase: {e}")
+        print(f" Error al consultar Supabase: {e}")
         raise HTTPException(status_code=500, detail="Error al recuperar registros")
 
