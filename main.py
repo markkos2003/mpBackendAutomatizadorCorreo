@@ -8,7 +8,7 @@ app = FastAPI(title="SUNAT Engine API", version="1.0")
 # Configurar permisos para Angular
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.FRONTEND_URL, "http://localhost:4200"],
+    allow_origins=[settings.FRONTEND_URL, "http://localhost:4200","https://mp-fronted-automatizador-correo.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
